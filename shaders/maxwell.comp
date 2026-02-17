@@ -1,0 +1,97 @@
+#version 430
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+// Field SSBOs — Yee grid staggered components for 2D TM mode
+layout(std430, binding = 0) buffer EzBuffer { float Ez[]; };
+layout(std430, binding = 1) buffer HxBuffer { float Hx[]; };
+layout(std430, binding = 2) buffer HyBuffer { float Hy[]; };
+
+// Simulation parameters (std140 UBO)
+layout(std140, binding = 0) uniform SimParams {
+    int   nx;
+    int   ny;
+    int   source_x;
+    int   source_y;
+    float dx;
+    float dt;
+    float time;
+    float source_freq;
+    float source_amp;
+    float field_scale;
+    int   timestep;
+    int   _pad0;
+};
+
+// 0 = update H fields, 1 = update E fields + source + ABC
+uniform int updateStep;
+
+// Absorbing boundary layer — quadratic conductivity profile
+float getSigma(int x, int y) {
+    const int   BW        = 30;
+    const float sigma_max = 0.4;
+
+    float sx = 0.0, sy = 0.0;
+
+    if (x < BW)       sx = float(BW - x)           / float(BW);
+    if (x >= nx - BW) sx = float(x - (nx - 1 - BW)) / float(BW);
+    if (y < BW)       sy = float(BW - y)           / float(BW);
+    if (y >= ny - BW) sy = float(y - (ny - 1 - BW)) / float(BW);
+
+    return sigma_max * (sx * sx + sy * sy);
+}
+
+void main() {
+    int x = int(gl_GlobalInvocationID.x);
+    int y = int(gl_GlobalInvocationID.y);
+
+    if (x >= nx || y >= ny) return;
+
+    int idx = y * nx + x;
+    float sigma = getSigma(x, y);
+
+    if (updateStep == 0) {
+        // ── H field update (leapfrog half-step) ──
+        // Hx(i,j) -= (dt / mu0 / dx) * [Ez(i, j+1) - Ez(i, j)]
+        // Hy(i,j) += (dt / mu0 / dx) * [Ez(i+1, j) - Ez(i, j)]
+        // mu0 = 1, dx = 1 in normalized units  =>  coeff = dt
+
+        float coeff = dt / dx;
+        float loss  = sigma * dt * 0.5;
+        float ca    = (1.0 - loss) / (1.0 + loss);   // damping
+        float cb    = coeff        / (1.0 + loss);   // curl coefficient
+
+        if (y < ny - 1) {
+            float dEz_dy = Ez[(y + 1) * nx + x] - Ez[idx];
+            Hx[idx] = ca * Hx[idx] - cb * dEz_dy;
+        }
+
+        if (x < nx - 1) {
+            float dEz_dx = Ez[y * nx + (x + 1)] - Ez[idx];
+            Hy[idx] = ca * Hy[idx] + cb * dEz_dx;
+        }
+    }
+    else {
+        // ── E field update (leapfrog half-step) ──
+        // Ez(i,j) += (dt / eps0 / dx) * [Hy(i,j) - Hy(i-1,j) - Hx(i,j) + Hx(i,j-1)]
+        // eps0 = 1, dx = 1  =>  coeff = dt
+
+        float coeff = dt / dx;
+        float loss  = sigma * dt * 0.5;
+        float ca    = (1.0 - loss) / (1.0 + loss);
+        float cb    = coeff        / (1.0 + loss);
+
+        if (x > 0 && x < nx - 1 && y > 0 && y < ny - 1) {
+            float dHy_dx = Hy[idx] - Hy[y * nx + (x - 1)];
+            float dHx_dy = Hx[idx] - Hx[(y - 1) * nx + x];
+
+            Ez[idx] = ca * Ez[idx] + cb * (dHy_dx - dHx_dy);
+        }
+
+        // Soft sinusoidal point source (additive)
+        if (x == source_x && y == source_y) {
+            float omega = 2.0 * 3.14159265358979 * source_freq;
+            Ez[idx] += source_amp * sin(omega * time);
+        }
+    }
+}
