@@ -1,9 +1,0 @@
-{
-    "name": "em-wave",
-    "version": "0.1.0",
-    "dependencies": [
-        "glew",
-        "glfw3",
-        "glm"
-    ]
-}
