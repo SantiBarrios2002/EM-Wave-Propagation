@@ -1,0 +1,121 @@
+#version 430
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 8) in;
+
+// Field SSBOs — full 3D Yee grid (6 components)
+layout(std430, binding = 0) buffer ExBuffer { float Ex[]; };
+layout(std430, binding = 1) buffer EyBuffer { float Ey[]; };
+layout(std430, binding = 2) buffer EzBuffer { float Ez[]; };
+layout(std430, binding = 3) buffer HxBuffer { float Hx[]; };
+layout(std430, binding = 4) buffer HyBuffer { float Hy[]; };
+layout(std430, binding = 5) buffer HzBuffer { float Hz[]; };
+
+// Simulation parameters (std140 UBO)
+layout(std140, binding = 0) uniform SimParams3D {
+    int   nx;
+    int   ny;
+    int   nz;
+    int   source_x;
+    int   source_y;
+    int   source_z;
+    float dx;
+    float dt;
+    float time;
+    float source_freq;
+    float source_amp;
+    float field_scale;
+    int   timestep;
+    int   render_component;
+    int   slice_axis;
+    int   slice_index;
+};
+
+// 0 = update H fields, 1 = update E fields + source + ABC
+uniform int updateStep;
+
+int idx(int x, int y, int z) {
+    return z * nx * ny + y * nx + x;
+}
+
+// Absorbing boundary layer — quadratic conductivity on all 6 faces
+float getSigma(int x, int y, int z) {
+    const int   BW        = 20;
+    const float sigma_max = 0.4;
+
+    float sx = 0.0, sy = 0.0, sz = 0.0;
+
+    if (x < BW)       sx = float(BW - x)            / float(BW);
+    if (x >= nx - BW) sx = float(x - (nx - 1 - BW)) / float(BW);
+    if (y < BW)       sy = float(BW - y)            / float(BW);
+    if (y >= ny - BW) sy = float(y - (ny - 1 - BW)) / float(BW);
+    if (z < BW)       sz = float(BW - z)            / float(BW);
+    if (z >= nz - BW) sz = float(z - (nz - 1 - BW)) / float(BW);
+
+    return sigma_max * (sx * sx + sy * sy + sz * sz);
+}
+
+void main() {
+    int x = int(gl_GlobalInvocationID.x);
+    int y = int(gl_GlobalInvocationID.y);
+    int z = int(gl_GlobalInvocationID.z);
+
+    if (x >= nx || y >= ny || z >= nz) return;
+
+    int i = idx(x, y, z);
+    float sigma = getSigma(x, y, z);
+    float coeff = dt / dx;
+    float loss  = sigma * dt * 0.5;
+    float ca    = (1.0 - loss) / (1.0 + loss);
+    float cb    = coeff        / (1.0 + loss);
+
+    if (updateStep == 0) {
+        // ── H field update ──
+        // Hx -= (dt/dx) * [Ez(i,j+1,k) - Ez(i,j,k) - Ey(i,j,k+1) + Ey(i,j,k)]
+        // Hy -= (dt/dx) * [Ex(i,j,k+1) - Ex(i,j,k) - Ez(i+1,j,k) + Ez(i,j,k)]
+        // Hz -= (dt/dx) * [Ey(i+1,j,k) - Ey(i,j,k) - Ex(i,j+1,k) + Ex(i,j,k)]
+
+        if (y < ny - 1 && z < nz - 1) {
+            float dEz_dy = Ez[idx(x, y+1, z)] - Ez[i];
+            float dEy_dz = Ey[idx(x, y, z+1)] - Ey[i];
+            Hx[i] = ca * Hx[i] - cb * (dEz_dy - dEy_dz);
+        }
+
+        if (x < nx - 1 && z < nz - 1) {
+            float dEx_dz = Ex[idx(x, y, z+1)] - Ex[i];
+            float dEz_dx = Ez[idx(x+1, y, z)] - Ez[i];
+            Hy[i] = ca * Hy[i] - cb * (dEx_dz - dEz_dx);
+        }
+
+        if (x < nx - 1 && y < ny - 1) {
+            float dEy_dx = Ey[idx(x+1, y, z)] - Ey[i];
+            float dEx_dy = Ex[idx(x, y+1, z)] - Ex[i];
+            Hz[i] = ca * Hz[i] - cb * (dEy_dx - dEx_dy);
+        }
+    }
+    else {
+        // ── E field update ──
+        // Ex += (dt/dx) * [Hz(i,j,k) - Hz(i,j-1,k) - Hy(i,j,k) + Hy(i,j,k-1)]
+        // Ey += (dt/dx) * [Hx(i,j,k) - Hx(i,j,k-1) - Hz(i,j,k) + Hz(i-1,j,k)]
+        // Ez += (dt/dx) * [Hy(i,j,k) - Hy(i-1,j,k) - Hx(i,j,k) + Hx(i,j-1,k)]
+
+        if (x > 0 && x < nx-1 && y > 0 && y < ny-1 && z > 0 && z < nz-1) {
+            float dHz_dy = Hz[i] - Hz[idx(x, y-1, z)];
+            float dHy_dz = Hy[i] - Hy[idx(x, y, z-1)];
+            Ex[i] = ca * Ex[i] + cb * (dHz_dy - dHy_dz);
+
+            float dHx_dz = Hx[i] - Hx[idx(x, y, z-1)];
+            float dHz_dx = Hz[i] - Hz[idx(x-1, y, z)];
+            Ey[i] = ca * Ey[i] + cb * (dHx_dz - dHz_dx);
+
+            float dHy_dx = Hy[i] - Hy[idx(x-1, y, z)];
+            float dHx_dy = Hx[i] - Hx[idx(x, y-1, z)];
+            Ez[i] = ca * Ez[i] + cb * (dHy_dx - dHx_dy);
+        }
+
+        // Oscillating dipole source (Ez component at grid center)
+        if (x == source_x && y == source_y && z == source_z) {
+            float omega = 2.0 * 3.14159265358979 * source_freq;
+            Ez[i] += source_amp * sin(omega * time);
+        }
+    }
+}

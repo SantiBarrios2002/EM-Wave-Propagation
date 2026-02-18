@@ -52,9 +52,20 @@ add_executable(2D_wave 2D_wave.cpp)
 target_include_directories(2D_wave PRIVATE ${CMAKE_SOURCE_DIR}/include)
 target_link_libraries(2D_wave PRIVATE ${COMMON_LIBS})
 
+# Phase 2: 3D wave simulation
+add_executable(3D_wave 3D_wave.cpp)
+target_include_directories(3D_wave PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_link_libraries(3D_wave PRIVATE ${COMMON_LIBS})
+
 # Copy shaders to build directory
 add_custom_command(TARGET 2D_wave POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_directory
     ${CMAKE_SOURCE_DIR}/shaders
     $<TARGET_FILE_DIR:2D_wave>/shaders
+)
+
+add_custom_command(TARGET 3D_wave POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+    ${CMAKE_SOURCE_DIR}/shaders
+    $<TARGET_FILE_DIR:3D_wave>/shaders
 )
